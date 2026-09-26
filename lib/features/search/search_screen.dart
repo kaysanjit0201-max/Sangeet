@@ -1,0 +1,2549 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/material.dart';
+import 'package:marquee/marquee.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:sangeet/core/theme/app_theme.dart';
+import 'package:sangeet/core/theme/responsive.dart';
+import 'package:sangeet/core/utils/audio_player_service.dart';
+import 'package:sangeet/data/api/saavn_api.dart';
+import 'package:sangeet/data/api/youtube_api.dart';
+import 'package:sangeet/data/models/saavn_song.dart';
+import 'package:sangeet/features/search/widgets/song_card.dart';
+import 'package:sangeet/features/search/chart_songs_screen.dart';
+import 'package:sangeet/features/library/local_audio_provider.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/foundation.dart';
+import '../../core/utils/app_logger.dart';
+import '../../core/utils/themed_container.dart';
+import '../../core/utils/themed_page.dart';
+import '../../core/utils/youtube_thumbnail_utils.dart';
+import '../../core/widgets/fallback_network_image.dart';
+
+class SearchScreen extends StatefulWidget {
+  const SearchScreen({super.key});
+
+  @override
+  State<SearchScreen> createState() => _SearchScreenState();
+}
+
+class _SearchScreenState extends State<SearchScreen>
+    with AutomaticKeepAliveClientMixin<SearchScreen> {
+  final TextEditingController _controller = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  final ScrollController _chartsScrollController = ScrollController();
+  final ScrollController _albumsScrollController = ScrollController();
+  final ScrollController _searchAlbumsScrollController = ScrollController();
+  Future<List<SaavnSong>>? _searchFuture;
+  Future<List<YtmAlbum>>? _albumSearchFuture;
+  String _lastQuery = '';
+  Timer? _debounce;
+  static final Map<String, _SessionSearchCacheEntry> _sessionSearchCache = {};
+  static const int _maxSessionCacheEntries = 80;
+  static const String _quickPicksQuery = 'trending music';
+  static const Duration _quickPicksCacheTtl = Duration(hours: 1);
+  static const String _quickPicksCacheDataPrefix = 'quick_picks_cache_v2_';
+  static const String _quickPicksCacheTsPrefix = 'quick_picks_cache_ts_v2_';
+  static const int _quickPicksTargetCount = 24;
+  static const int _chartsTargetCount = 10;
+  static const int _albumsTargetCount = 10;
+  static const int _trendingSongsTargetCount = 12;
+  static const double _mobileSectionBodyHeight = 240;
+  static const double _desktopSectionBodyHeight = 286;
+  static const List<String> _trendingSongsQueries = <String>[
+    'trending in shorts',
+    'latest singles',
+    'today\'s top songs',
+    'viral songs',
+    'top songs',
+  ];
+  static const List<String> _globallyBlockedTitleTokens = <String>[
+    'trending',
+    'new song',
+    'new songs',
+    'latest song',
+    'new trending',
+    'requested mix',
+    'request mix',
+    'mix songs',
+    'instagram',
+    'insta reel',
+    'reels',
+    'shorts',
+    'yt shorts',
+    'tik tok',
+    'tiktok',
+    'viral song',
+    '#',
+    '4k',
+    '8k',
+    'hd',
+    'desi song',
+    'desi songs',
+    'indian song',
+    'indian songs',
+    'best song',
+    'best songs',
+    'top song',
+    'top songs',
+  ];
+  static const List<String> _quickPicksFallbackBlockedTitleTokens = <String>[
+    'requested mix',
+    'request mix',
+    'mix songs',
+    'instagram',
+    'insta reel',
+    'reels',
+    'shorts',
+    'yt shorts',
+    'tik tok',
+    'tiktok',
+  ];
+
+  double _sectionBodyHeightFor(BuildContext context) {
+    return ResponsiveLayout.isExpanded(context)
+        ? _desktopSectionBodyHeight
+        : _mobileSectionBodyHeight;
+  }
+
+  static const int minSearchLength = 2;
+
+  late List<LocalAudioTrack> _localAudios = [];
+  late Future<List<LocalAudioTrack>> _localAudiosFuture = Future.value([]);
+  Future<_HomeSectionsData>? _homeSectionsFuture;
+  bool _servicesReady = false;
+  bool _useYoutubeService = false;
+  bool _useSaavnService = false;
+
+  bool get isSearching => _controller.text.trim().isNotEmpty;
+
+  @override
+  void initState() {
+    super.initState();
+    _initSearchMode();
+  }
+
+  Future<void> _initSearchMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    final useYoutube = prefs.getBool('use_youtube_service') ?? false;
+    final useSaavn = prefs.getBool('use_saavn_service') ?? false;
+    if (!mounted) return;
+    if (!useYoutube && !useSaavn) {
+      setState(() {
+        _servicesReady = true;
+        _useYoutubeService = false;
+        _useSaavnService = false;
+        _homeSectionsFuture = null;
+        _albumSearchFuture = null;
+        _localAudiosFuture = _loadLocalAudiosWithPermission();
+      });
+      _localAudiosFuture.then((tracks) {
+        if (!mounted) return;
+        setState(() => _localAudios = tracks);
+      });
+    } else {
+      setState(() {
+        _servicesReady = true;
+        _useYoutubeService = useYoutube;
+        _useSaavnService = useSaavn;
+        _searchFuture = _performSearch(_quickPicksQuery);
+        _albumSearchFuture = null;
+        _homeSectionsFuture = useYoutube ? _loadHomeSections() : null;
+      });
+    }
+  }
+
+  Future<bool> _ensureAudioPermission() async {
+    if (!Platform.isAndroid) return true;
+
+    var audioStatus = await Permission.audio.status;
+    if (audioStatus.isGranted || audioStatus.isLimited) {
+      return true;
+    }
+
+    audioStatus = await Permission.audio.request();
+    if (audioStatus.isGranted || audioStatus.isLimited) {
+      return true;
+    }
+
+    var storageStatus = await Permission.storage.status;
+    if (storageStatus.isGranted) return true;
+    storageStatus = await Permission.storage.request();
+    return storageStatus.isGranted;
+  }
+
+  Future<List<LocalAudioTrack>> _loadLocalAudiosWithPermission() async {
+    final granted = await _ensureAudioPermission();
+    if (!granted) return const [];
+    return LocalAudioProvider.load(maxItems: 500);
+  }
+
+  Future<void> _refreshSearch() async {
+    final prefs = await SharedPreferences.getInstance();
+    final useYoutube = prefs.getBool('use_youtube_service') ?? false;
+    final useSaavn = prefs.getBool('use_saavn_service') ?? false;
+    final query = _controller.text.trim();
+
+    Future<List<LocalAudioTrack>>? localAudiosFuture;
+
+    setState(() {
+      _servicesReady = true;
+      _useYoutubeService = useYoutube;
+      _useSaavnService = useSaavn;
+      if (query.isEmpty) {
+        _lastQuery = '';
+        if (!useYoutube && !useSaavn) {
+          _homeSectionsFuture = null;
+          _searchFuture = null;
+          _albumSearchFuture = null;
+          _localAudiosFuture = _loadLocalAudiosWithPermission();
+          localAudiosFuture = _localAudiosFuture;
+        } else {
+          _searchFuture = _performSearch(_quickPicksQuery, forceRefresh: true);
+          _albumSearchFuture = null;
+          _homeSectionsFuture = useYoutube
+              ? _loadHomeSections(forceRefresh: true)
+              : null;
+        }
+      } else if (query.length < minSearchLength) {
+        _searchFuture = null;
+        _albumSearchFuture = null;
+      } else {
+        _lastQuery = query;
+        _searchFuture = (!useYoutube && !useSaavn)
+            ? _searchLocalAudios(query)
+            : _performSearch(query, forceRefresh: true);
+        _albumSearchFuture = useYoutube
+            ? _performAlbumSearch(query, forceRefresh: true)
+            : null;
+      }
+    });
+
+    if (localAudiosFuture != null) {
+      final tracks = await localAudiosFuture!;
+      if (!mounted) return;
+      setState(() => _localAudios = tracks);
+    }
+
+    if (useYoutube || useSaavn) {
+      await _searchFuture?.catchError((_) => <SaavnSong>[]);
+      if (useYoutube && query.length >= minSearchLength) {
+        await _albumSearchFuture?.catchError((_) => <YtmAlbum>[]);
+      }
+    }
+  }
+
+  Future<List<SaavnSong>> _searchLocalAudios(String query) async {
+    final normalized = query.toLowerCase();
+    final results = _localAudios
+        .where((track) => track.name.toLowerCase().contains(normalized))
+        .map(
+          (track) => SaavnSong(
+            id: track.path,
+            name: track.name,
+            artists: 'Local Audio',
+            imageUrl: '',
+            duration: 0,
+            downloadUrls: const [],
+          ),
+        )
+        .toList();
+    return results;
+  }
+
+  Future<List<YtmAlbum>> _performAlbumSearch(
+    String query, {
+    bool forceRefresh = false,
+  }) async {
+    final normalizedQuery = query.trim();
+    if (normalizedQuery.isEmpty || normalizedQuery.length < minSearchLength) {
+      return const <YtmAlbum>[];
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    final useYoutube = prefs.getBool('use_youtube_service') ?? false;
+    if (!useYoutube) return const <YtmAlbum>[];
+
+    try {
+      return await YoutubeApi.searchAlbums(
+        normalizedQuery,
+        take: _albumsTargetCount,
+        forceRefresh: forceRefresh,
+      );
+    } catch (_) {
+      return const <YtmAlbum>[];
+    }
+  }
+
+  Future<List<SaavnSong>> _performSearch(
+    String query, {
+    bool forceRefresh = false,
+  }) async {
+    final normalizedQuery = query.trim();
+    if (normalizedQuery.isEmpty) return [];
+
+    final prefs = await SharedPreferences.getInstance();
+    final useYoutube = prefs.getBool('use_youtube_service') ?? false;
+    final useSaavn = prefs.getBool('use_saavn_service') ?? false;
+
+    if (!useYoutube && !useSaavn) return const [];
+    final isQuickPicksQuery = normalizedQuery.toLowerCase() == _quickPicksQuery;
+    final cacheKey =
+        '${useYoutube
+            ? "yt"
+            : useSaavn
+            ? "saavn"
+            : "none"}:${normalizedQuery.toLowerCase()}';
+
+    if (!forceRefresh) {
+      final cached = _sessionSearchCache[cacheKey];
+      if (cached != null) {
+        final globallyFiltered = _applyGlobalResultFilter(cached.songs);
+        if (isQuickPicksQuery) {
+          final curated = _resolveQuickPicksSongs(cached.songs);
+          _sessionSearchCache[cacheKey] = _SessionSearchCacheEntry(
+            songs: curated,
+          );
+          return curated;
+        }
+        if (globallyFiltered.length != cached.songs.length) {
+          _sessionSearchCache[cacheKey] = _SessionSearchCacheEntry(
+            songs: globallyFiltered,
+          );
+        }
+        return globallyFiltered;
+      }
+
+      if (isQuickPicksQuery) {
+        final persisted = _readQuickPicksCache(prefs, useYoutube: useYoutube);
+        if (persisted != null && persisted.isNotEmpty) {
+          final curated = _resolveQuickPicksSongs(persisted);
+          _sessionSearchCache[cacheKey] = _SessionSearchCacheEntry(
+            songs: curated,
+          );
+          _trimSessionSearchCache();
+          return curated;
+        }
+      }
+    }
+
+    try {
+      final List<SaavnSong> songs;
+
+      if (useYoutube) {
+        AppLogger.info('Using YouTube service for search: "$normalizedQuery"');
+        songs = await YoutubeApi.searchSongs(
+          normalizedQuery,
+          forceRefresh: forceRefresh,
+        );
+      } else if (useSaavn) {
+        AppLogger.info('Using Saavn service for search: "$normalizedQuery"');
+        songs = await SaavnApi.searchSongs(normalizedQuery);
+      } else {
+        return const [];
+      }
+
+      final globallyFiltered = _applyGlobalResultFilter(songs);
+      final resolvedSongs = isQuickPicksQuery
+          ? _resolveQuickPicksSongs(songs)
+          : globallyFiltered;
+      _sessionSearchCache[cacheKey] = _SessionSearchCacheEntry(
+        songs: List<SaavnSong>.unmodifiable(resolvedSongs),
+      );
+      _trimSessionSearchCache();
+
+      if (isQuickPicksQuery && resolvedSongs.isNotEmpty) {
+        await _writeQuickPicksCache(
+          prefs,
+          useYoutube: useYoutube,
+          songs: resolvedSongs,
+        );
+      }
+
+      return _sessionSearchCache[cacheKey]!.songs;
+    } catch (_) {
+      if (isQuickPicksQuery) {
+        final staleFallback = _readQuickPicksCache(
+          prefs,
+          useYoutube: useYoutube,
+          allowExpired: true,
+        );
+        if (staleFallback != null && staleFallback.isNotEmpty) {
+          final curated = _resolveQuickPicksSongs(staleFallback);
+          _sessionSearchCache[cacheKey] = _SessionSearchCacheEntry(
+            songs: curated,
+          );
+          _trimSessionSearchCache();
+          return curated;
+        }
+      }
+      rethrow;
+    }
+  }
+
+  List<SaavnSong> _resolveQuickPicksSongs(List<SaavnSong> songs) {
+    final strict = _curateQuickPicks(songs);
+    if (strict.isNotEmpty) return strict;
+
+    final fallbackBase = _applyQuickPicksFallbackFilter(songs);
+    if (fallbackBase.isEmpty) return const [];
+    return _curateQuickPicks(fallbackBase, preFiltered: true);
+  }
+
+  List<SaavnSong> _curateQuickPicks(
+    List<SaavnSong> songs, {
+    bool preFiltered = false,
+  }) {
+    final baseSongs = preFiltered ? songs : _applyGlobalResultFilter(songs);
+    if (baseSongs.isEmpty) return const [];
+
+    final nonVariantSongs = baseSongs
+        .where((song) => !_isLikelyVersionVariantTitle(song.name))
+        .toList(growable: false);
+    final sourceForCuration = nonVariantSongs.isNotEmpty
+        ? nonVariantSongs
+        : baseSongs;
+    final dedupedSongs = _dedupeSongsForQuickPicks(sourceForCuration);
+    if (dedupedSongs.isEmpty) return const [];
+
+    final scored = dedupedSongs
+        .map((song) => _ScoredSong(song: song, score: _quickPickScore(song)))
+        .toList(growable: false);
+
+    final strict = scored.where((e) => e.score >= 0).toList(growable: false)
+      ..sort((a, b) => b.score.compareTo(a.score));
+    if (strict.length >= 12) {
+      return strict
+          .take(_quickPicksTargetCount)
+          .map((e) => e.song)
+          .toList(growable: false);
+    }
+
+    final relaxed = scored.where((e) => e.score >= -2).toList(growable: false)
+      ..sort((a, b) => b.score.compareTo(a.score));
+    if (relaxed.isNotEmpty) {
+      return relaxed
+          .take(_quickPicksTargetCount)
+          .map((e) => e.song)
+          .toList(growable: false);
+    }
+
+    final fallback = [...scored]..sort((a, b) => b.score.compareTo(a.score));
+    return fallback
+        .take(_quickPicksTargetCount)
+        .map((e) => e.song)
+        .toList(growable: false);
+  }
+
+  List<SaavnSong> _dedupeSongsForQuickPicks(List<SaavnSong> songs) {
+    if (songs.isEmpty) return const [];
+
+    final out = <SaavnSong>[];
+    final seenIds = <String>{};
+    final seenContent = <String>{};
+
+    for (final song in songs) {
+      final id = song.id.trim().toLowerCase();
+      if (id.isNotEmpty && !seenIds.add(id)) continue;
+
+      final key = _quickPickContentKey(song);
+      if (key.isNotEmpty && !seenContent.add(key)) continue;
+
+      out.add(song);
+    }
+    return out;
+  }
+
+  String _quickPickContentKey(SaavnSong song) {
+    final title = _normalizeQuickPickTitle(song.name);
+    if (title.isEmpty) return '';
+    final artist = _normalizeQuickPickArtist(song.artists);
+    return '$title::$artist';
+  }
+
+  String _normalizeQuickPickTitle(String raw) {
+    var title = raw.toLowerCase().trim();
+    if (title.isEmpty) return '';
+
+    title = title.replaceAll(RegExp(r'[\(\[\{].*?[\)\]\}]'), ' ');
+    title = title.replaceAll(
+      RegExp(
+        r'\b(official|audio|video|lyrics?|lyric|full\s*song|visualizer|4k|8k|hd)\b',
+      ),
+      ' ',
+    );
+    title = title.replaceAll(RegExp(r'\b(feat|ft)\.?\b.*$'), ' ');
+    title = title.replaceAll(
+      RegExp(
+        r'\b(remix|remastered|remaster|live|acoustic|slowed|reverb|sped\s*up|nightcore|instrumental|karaoke|cover|mashup|version|mix|edit|extended|radio)\b',
+      ),
+      ' ',
+    );
+    title = title.replaceAll(RegExp(r'[^a-z0-9]+'), ' ');
+    title = title.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return title;
+  }
+
+  bool _isLikelyVersionVariantTitle(String title) {
+    final text = title.toLowerCase();
+    return RegExp(
+      r'\b(remix|remastered|remaster|live|acoustic|slowed|reverb|sped\s*up|nightcore|instrumental|karaoke|cover|mashup|bootleg|vip|version|mix|edit|extended|radio)\b',
+      caseSensitive: false,
+    ).hasMatch(text);
+  }
+
+  String _normalizeQuickPickArtist(String raw) {
+    var text = raw.toLowerCase().trim();
+    if (text.isEmpty || text == 'unknown') return '';
+
+    text = text.replaceAll('&', ',');
+    text = text.replaceAll(RegExp(r'\b(and|with|x)\b'), ',');
+    text = text.replaceAll(RegExp(r'\b(feat|ft)\.?\b'), ',');
+
+    final parts = text
+        .split(',')
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .map((e) => e.replaceAll(RegExp(r'[^a-z0-9 ]+'), ' ').trim())
+        .where((e) => e.isNotEmpty)
+        .toList(growable: false);
+
+    if (parts.isEmpty) return '';
+    return parts.first.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  int _quickPickScore(SaavnSong song) {
+    final title = song.name.toLowerCase();
+    final artist = song.artists.toLowerCase();
+    final combined = '$title $artist';
+
+    const hardBlocked = <String>[
+      'happy birthday',
+      'birthday song',
+      'nursery rhyme',
+      'nursery rhymes',
+      'kids song',
+      'baby song',
+      'lullaby',
+      'cocomelon',
+      'johny johny',
+      'wheels on the bus',
+      'podcast',
+      'interview',
+      'reaction',
+      'prank',
+      'vlog',
+      'tutorial',
+    ];
+    if (hardBlocked.any(combined.contains)) return -100;
+
+    var score = 0;
+    final seconds = song.duration ?? 0;
+
+    if (seconds >= 90 && seconds <= 6 * 60) {
+      score += 3;
+    } else if (seconds >= 60 && seconds <= 10 * 60) {
+      score += 1;
+    } else if (seconds > 0) {
+      score -= 2;
+    }
+
+    if (artist.trim().isNotEmpty && artist != 'unknown') {
+      score += 1;
+    } else {
+      score -= 1;
+    }
+
+    const goodSignals = <String>[
+      'official',
+      'audio',
+      'lyrics',
+      'lyric',
+      'vevo',
+      'topic',
+      'soundtrack',
+      'ost',
+    ];
+    if (goodSignals.any(combined.contains)) {
+      score += 2;
+    }
+
+    const weakSignals = <String>[
+      'cover',
+      'karaoke',
+      'instrumental',
+      'slowed',
+      'reverb',
+      'nightcore',
+      '8d',
+      'sped up',
+      'mashup',
+    ];
+    if (weakSignals.any(combined.contains)) {
+      score -= 2;
+    }
+
+    return score;
+  }
+
+  List<SaavnSong> _applyGlobalResultFilter(List<SaavnSong> songs) {
+    if (songs.isEmpty) return const [];
+    return songs.where(_passesGlobalResultFilter).toList(growable: false);
+  }
+
+  List<SaavnSong> _applyQuickPicksFallbackFilter(List<SaavnSong> songs) {
+    if (songs.isEmpty) return const [];
+
+    return songs
+        .where((song) {
+          final title = song.name.trim();
+          if (title.isEmpty) return false;
+          if (_containsEmoji(title)) return false;
+          final lowered = title.toLowerCase();
+          if (_quickPicksFallbackBlockedTitleTokens.any(lowered.contains)) {
+            return false;
+          }
+          return true;
+        })
+        .toList(growable: false);
+  }
+
+  bool _passesGlobalResultFilter(SaavnSong song) {
+    final title = song.name.trim();
+    if (title.isEmpty) return false;
+
+    if (_containsEmoji(title)) return false;
+
+    final lowered = title.toLowerCase();
+    if (_globallyBlockedTitleTokens.any(lowered.contains)) return false;
+
+    return true;
+  }
+
+  bool _containsEmoji(String value) {
+    for (final rune in value.runes) {
+      final isEmoji =
+          (rune >= 0x1F300 && rune <= 0x1FAFF) ||
+          (rune >= 0x2600 && rune <= 0x27BF) ||
+          (rune >= 0xFE00 && rune <= 0xFE0F);
+      if (isEmoji) return true;
+    }
+    return false;
+  }
+
+  List<SaavnSong>? _readQuickPicksCache(
+    SharedPreferences prefs, {
+    required bool useYoutube,
+    bool allowExpired = false,
+  }) {
+    final sourceKey = useYoutube ? 'yt' : 'saavn';
+    final dataKey = '$_quickPicksCacheDataPrefix$sourceKey';
+    final tsKey = '$_quickPicksCacheTsPrefix$sourceKey';
+
+    final raw = prefs.getString(dataKey);
+    if (raw == null || raw.trim().isEmpty) return null;
+
+    final ts = prefs.getInt(tsKey);
+    if (!allowExpired) {
+      if (ts == null) return null;
+      final age = DateTime.now().difference(
+        DateTime.fromMillisecondsSinceEpoch(ts),
+      );
+      if (age > _quickPicksCacheTtl) return null;
+    }
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return null;
+
+      final songs = <SaavnSong>[];
+      for (final item in decoded) {
+        final song = _songFromCache(item);
+        if (song != null) songs.add(song);
+      }
+
+      if (songs.isEmpty) return null;
+      return List<SaavnSong>.unmodifiable(songs);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _writeQuickPicksCache(
+    SharedPreferences prefs, {
+    required bool useYoutube,
+    required List<SaavnSong> songs,
+  }) async {
+    final sourceKey = useYoutube ? 'yt' : 'saavn';
+    final dataKey = '$_quickPicksCacheDataPrefix$sourceKey';
+    final tsKey = '$_quickPicksCacheTsPrefix$sourceKey';
+
+    final payload = songs.map(_songToCache).toList(growable: false);
+    final encoded = jsonEncode(payload);
+
+    await prefs.setString(dataKey, encoded);
+    await prefs.setInt(tsKey, DateTime.now().millisecondsSinceEpoch);
+  }
+
+  Map<String, dynamic> _songToCache(SaavnSong song) {
+    return <String, dynamic>{
+      'id': song.id,
+      'name': song.name,
+      'artists': song.artists,
+      'imageUrl': song.imageUrl,
+      'duration': song.duration,
+      'downloadUrls': song.downloadUrls
+          .map(
+            (entry) => <String, String>{
+              'quality': entry['quality'] ?? '',
+              'url': entry['url'] ?? '',
+            },
+          )
+          .toList(growable: false),
+    };
+  }
+
+  SaavnSong? _songFromCache(dynamic raw) {
+    if (raw is! Map) return null;
+
+    final id = (raw['id'] ?? '').toString().trim();
+    final name = (raw['name'] ?? '').toString().trim();
+    final artists = (raw['artists'] ?? 'Unknown').toString().trim();
+    final imageUrl = (raw['imageUrl'] ?? '').toString().trim();
+
+    if (id.isEmpty || name.isEmpty) return null;
+
+    int? duration;
+    final rawDuration = raw['duration'];
+    if (rawDuration is int) {
+      duration = rawDuration;
+    } else if (rawDuration is String) {
+      duration = int.tryParse(rawDuration);
+    }
+
+    final downloadUrls = <Map<String, String>>[];
+    final rawDownloadUrls = raw['downloadUrls'];
+    if (rawDownloadUrls is List) {
+      for (final entry in rawDownloadUrls) {
+        if (entry is! Map) continue;
+        final quality = (entry['quality'] ?? '').toString().trim();
+        final url = (entry['url'] ?? '').toString().trim();
+        if (quality.isEmpty && url.isEmpty) continue;
+        downloadUrls.add(<String, String>{'quality': quality, 'url': url});
+      }
+    }
+
+    return SaavnSong(
+      id: id,
+      name: name,
+      artists: artists.isEmpty ? 'Unknown' : artists,
+      imageUrl: imageUrl,
+      duration: duration,
+      downloadUrls: downloadUrls,
+    );
+  }
+
+  void _trimSessionSearchCache() {
+    while (_sessionSearchCache.length > _maxSessionCacheEntries) {
+      _sessionSearchCache.remove(_sessionSearchCache.keys.first);
+    }
+  }
+
+  Future<List<SaavnSong>> _loadTrendingSongs({
+    bool forceRefresh = false,
+  }) async {
+    final collected = <SaavnSong>[];
+    final seenIds = <String>{};
+    final seenKeys = <String>{};
+
+    String contentKey(SaavnSong song) {
+      final title = song.name.trim().toLowerCase();
+      final artist = song.artists.trim().toLowerCase();
+      return '$title::$artist';
+    }
+
+    bool looksLikeSingleSong(SaavnSong song) {
+      final text = '${song.name} ${song.artists}'.toLowerCase();
+      const blocked = <String>[
+        'full album',
+        'podcast',
+        'episode',
+        'interview',
+        'reaction',
+        'playlist',
+      ];
+      if (blocked.any(text.contains)) return false;
+      if (_isLikelyVersionVariantTitle(song.name)) return false;
+      final duration = song.duration ?? 0;
+      if (duration > 0 && duration > 15 * 60) return false;
+      return true;
+    }
+
+    for (final query in _trendingSongsQueries) {
+      List<SaavnSong> batch = const <SaavnSong>[];
+      try {
+        batch = await _performSearch(query, forceRefresh: forceRefresh);
+      } catch (_) {
+        continue;
+      }
+
+      for (final song in batch) {
+        if (!looksLikeSingleSong(song)) continue;
+        final id = song.id.trim().toLowerCase();
+        if (id.isNotEmpty && !seenIds.add(id)) continue;
+        final key = contentKey(song);
+        if (key.isNotEmpty && !seenKeys.add(key)) continue;
+        collected.add(song);
+        if (collected.length >= _trendingSongsTargetCount) {
+          return collected;
+        }
+      }
+    }
+
+    if (collected.length < _trendingSongsTargetCount) {
+      final fallbackQueries = <String>[
+        _quickPicksQuery,
+        'latest songs',
+        'popular songs',
+      ];
+      for (final query in fallbackQueries) {
+        List<SaavnSong> batch = const <SaavnSong>[];
+        try {
+          batch = await _performSearch(query, forceRefresh: forceRefresh);
+        } catch (_) {
+          continue;
+        }
+        for (final song in batch) {
+          if (!looksLikeSingleSong(song)) continue;
+          final id = song.id.trim().toLowerCase();
+          if (id.isNotEmpty && !seenIds.add(id)) continue;
+          final key = contentKey(song);
+          if (key.isNotEmpty && !seenKeys.add(key)) continue;
+          collected.add(song);
+          if (collected.length >= _trendingSongsTargetCount) {
+            return collected;
+          }
+        }
+      }
+    }
+
+    if (collected.isNotEmpty) {
+      return collected.take(_trendingSongsTargetCount).toList(growable: false);
+    }
+
+    try {
+      final fallback = await _performSearch(
+        _quickPicksQuery,
+        forceRefresh: forceRefresh,
+      );
+      return fallback.take(_trendingSongsTargetCount).toList(growable: false);
+    } catch (_) {
+      return const <SaavnSong>[];
+    }
+  }
+
+  Future<_HomeSectionsData> _loadHomeSections({
+    bool forceRefresh = false,
+  }) async {
+    final chartsTask = YoutubeApi.charts(
+      take: _chartsTargetCount,
+      forceRefresh: forceRefresh,
+    ).catchError((_) => const <YtmChart>[]);
+    final albumsTask = YoutubeApi.trendingAlbums(
+      take: _albumsTargetCount,
+      forceRefresh: forceRefresh,
+    ).catchError((_) => const <YtmAlbum>[]);
+    final songsTask = _loadTrendingSongs(
+      forceRefresh: forceRefresh,
+    ).catchError((_) => const <SaavnSong>[]);
+
+    final charts = await chartsTask;
+    final albums = await albumsTask;
+    final trendingSongs = await songsTask;
+
+    return _HomeSectionsData(
+      charts: charts,
+      albums: albums,
+      trendingSongs: trendingSongs,
+    );
+  }
+
+  Future<({bool useYoutube, bool useSaavn})> _resolveInputServices() async {
+    final perfMode = Provider.of<ThemeProvider>(
+      context,
+      listen: false,
+    ).resolvedUiPerformanceMode(context);
+    final smoothMode = perfMode == UiPerformanceMode.smooth;
+    if (smoothMode) {
+      return (useYoutube: _useYoutubeService, useSaavn: _useSaavnService);
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    return (
+      useYoutube: prefs.getBool('use_youtube_service') ?? false,
+      useSaavn: prefs.getBool('use_saavn_service') ?? false,
+    );
+  }
+
+  List<String> _buildDynamicSeedQueries(
+    List<SaavnSong> songs, {
+    int maxSeeds = 24,
+  }) {
+    if (songs.isEmpty) return const <String>[];
+    final out = <String>[];
+    final seen = <String>{};
+
+    void add(String value) {
+      final trimmed = value.trim();
+      if (trimmed.isEmpty) return;
+      final key = trimmed.toLowerCase();
+      if (!seen.add(key)) return;
+      out.add(trimmed);
+    }
+
+    for (final song in songs.take(12)) {
+      if (_isLikelyVersionVariantTitle(song.name)) continue;
+      final title = _normalizeQuickPickTitle(song.name);
+      final artist = _normalizeQuickPickArtist(song.artists);
+      if (title.isNotEmpty && artist.isNotEmpty) {
+        add('$title $artist');
+      }
+      if (title.isNotEmpty) add(title);
+      if (artist.isNotEmpty) add(artist);
+      if (out.length >= maxSeeds) break;
+    }
+
+    return out.take(maxSeeds).toList(growable: false);
+  }
+
+  void _onSearchChanged(String query) {
+    if (_debounce?.isActive ?? false) _debounce!.cancel();
+    final trimmed = query.trim();
+
+    if (trimmed.isEmpty) {
+      _resolveInputServices().then((services) {
+        if (!mounted) return;
+        final useYoutube = services.useYoutube;
+        final useSaavn = services.useSaavn;
+        setState(() {
+          _servicesReady = true;
+          _useYoutubeService = useYoutube;
+          _useSaavnService = useSaavn;
+          _lastQuery = '';
+          if (!useYoutube && !useSaavn) {
+            _homeSectionsFuture = null;
+            _searchFuture = null;
+            _albumSearchFuture = null;
+            _localAudiosFuture = _loadLocalAudiosWithPermission();
+            _localAudiosFuture.then((tracks) {
+              if (!mounted) return;
+              setState(() => _localAudios = tracks);
+            });
+          } else {
+            _searchFuture = _performSearch(_quickPicksQuery);
+            _albumSearchFuture = null;
+            _homeSectionsFuture = useYoutube ? _loadHomeSections() : null;
+          }
+        });
+      });
+      return;
+    }
+
+    if (trimmed.length < minSearchLength) {
+      setState(() {
+        _lastQuery = '';
+        _searchFuture = null;
+        _albumSearchFuture = null;
+      });
+      return;
+    }
+
+    _debounce = Timer(const Duration(milliseconds: 400), () {
+      if (trimmed == _lastQuery) return;
+
+      _resolveInputServices().then((services) {
+        if (!mounted) return;
+        final useYoutube = services.useYoutube;
+        final useSaavn = services.useSaavn;
+        setState(() {
+          _servicesReady = true;
+          _useYoutubeService = useYoutube;
+          _useSaavnService = useSaavn;
+          _lastQuery = trimmed;
+          if (!useYoutube && !useSaavn) {
+            _searchFuture = _searchLocalAudios(trimmed);
+            _albumSearchFuture = null;
+          } else {
+            _searchFuture = _performSearch(trimmed);
+            _albumSearchFuture = useYoutube
+                ? _performAlbumSearch(trimmed)
+                : null;
+          }
+        });
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _chartsScrollController.dispose();
+    _albumsScrollController.dispose();
+    _searchAlbumsScrollController.dispose();
+    _scrollController.dispose();
+    _controller.dispose();
+    _debounce?.cancel();
+    super.dispose();
+  }
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    final themeProvider = Provider.of<ThemeProvider>(context);
+    final theme = Theme.of(context);
+    final textTheme = theme.textTheme;
+    final perfMode = themeProvider.resolvedUiPerformanceMode(context);
+    final smoothMode = perfMode == UiPerformanceMode.smooth;
+
+    if (!_servicesReady) {
+      return const ThemedPage(
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    final useYoutube = _useYoutubeService;
+    final useSaavn = _useSaavnService;
+    final isLocalMode = !useYoutube && !useSaavn;
+    final headerText = isSearching ? 'Search Results' : 'Quick Picks';
+
+    return ThemedPage(
+      child: RefreshIndicator(
+        onRefresh: _refreshSearch,
+        child: CustomScrollView(
+          key: const PageStorageKey<String>('search_screen_list'),
+          controller: _scrollController,
+          physics: const AlwaysScrollableScrollPhysics(),
+          cacheExtent: smoothMode ? 420 : 720,
+          slivers: [
+            SliverToBoxAdapter(
+              child: Text(
+                'Welcome to\nSangeet',
+                style: textTheme.headlineSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            const SliverToBoxAdapter(child: SizedBox(height: 20)),
+            if (!kIsWeb &&
+                defaultTargetPlatform == TargetPlatform.windows &&
+                ResponsiveLayout.isExpanded(context))
+              SliverPersistentHeader(
+                pinned: true,
+                delegate: _StickySearchBarDelegate(
+                  height: 56 + 28,
+                  child: SearchBar(
+                    controller: _controller,
+                    hintText: isLocalMode
+                        ? 'Search local audio...'
+                        : 'Search songs, artists...',
+                    leading: const Icon(Icons.search),
+                    onChanged: _onSearchChanged,
+                    trailing: _controller.text.isEmpty
+                        ? null
+                        : [
+                            IconButton(
+                              icon: const Icon(Icons.close),
+                              onPressed: () {
+                                _controller.clear();
+                                _onSearchChanged('');
+                              },
+                            ),
+                          ],
+                  ),
+                ),
+              )
+            else ...[
+              SliverToBoxAdapter(
+                child: SearchBar(
+                  controller: _controller,
+                  hintText: isLocalMode
+                      ? 'Search local audio...'
+                      : 'Search songs, artists...',
+                  leading: const Icon(Icons.search),
+                  onChanged: _onSearchChanged,
+                  trailing: _controller.text.isEmpty
+                      ? null
+                      : [
+                          IconButton(
+                            icon: const Icon(Icons.close),
+                            onPressed: () {
+                              _controller.clear();
+                              _onSearchChanged('');
+                            },
+                          ),
+                        ],
+                ),
+              ),
+              const SliverToBoxAdapter(child: SizedBox(height: 28)),
+            ],
+
+            if (!isLocalMode || isSearching) ...[
+              SliverToBoxAdapter(
+                child: Text(
+                  headerText,
+                  style: textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SliverToBoxAdapter(child: SizedBox(height: 16)),
+            ],
+
+            if (isLocalMode)
+              SliverToBoxAdapter(child: _buildLocalSearchResults(context))
+            else
+              _buildSearchResultsSliver(context),
+
+            if (!isLocalMode && !isSearching && useYoutube) ...[
+              const SliverToBoxAdapter(child: SizedBox(height: 30)),
+              _buildHomeSectionsSliver(context),
+            ],
+
+            const SliverToBoxAdapter(child: SizedBox(height: 80)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHomeSectionsSliver(BuildContext context) {
+    _homeSectionsFuture ??= _loadHomeSections();
+    final themeProvider = Provider.of<ThemeProvider>(context, listen: false);
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final textTheme = theme.textTheme;
+
+    return FutureBuilder<_HomeSectionsData>(
+      future: _homeSectionsFuture,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return SliverList(
+            delegate: SliverChildListDelegate(<Widget>[
+              _buildSectionLoadingPlaceholder(
+                context,
+                title: 'Charts',
+                height: _sectionBodyHeightFor(context),
+                topPadding: 0,
+              ),
+              _buildSectionLoadingPlaceholder(
+                context,
+                title: 'Trending Albums',
+                height: _sectionBodyHeightFor(context),
+                topPadding: 24,
+              ),
+              _buildSectionLoadingPlaceholder(
+                context,
+                title: 'Trending Songs',
+                height: 900,
+                topPadding: 24,
+              ),
+            ]),
+          );
+        }
+
+        if (snapshot.hasError) {
+          return SliverToBoxAdapter(
+            child: ThemedContainer(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 12,
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      themeProvider.useGlassTheme
+                          ? CupertinoIcons.exclamationmark_triangle
+                          : Icons.error_outline,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'Failed to load home sections',
+                        style: textTheme.bodyMedium?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                    OutlinedButton(
+                      onPressed: () {
+                        setState(() {
+                          _homeSectionsFuture = _loadHomeSections(
+                            forceRefresh: true,
+                          );
+                        });
+                      },
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }
+
+        final data = snapshot.data ?? const _HomeSectionsData.empty();
+        return SliverList(
+          delegate: SliverChildListDelegate(<Widget>[
+            _buildChartsSection(context, data.charts),
+            _buildTrendingAlbumsSection(context, data.albums),
+            _buildTrendingSongsSection(context, data.trendingSongs),
+          ]),
+        );
+      },
+    );
+  }
+
+  Widget _buildSectionLoadingPlaceholder(
+    BuildContext context, {
+    required String title,
+    required double? height,
+    required double topPadding,
+  }) {
+    final textTheme = Theme.of(context).textTheme;
+    return Padding(
+      padding: EdgeInsets.only(top: topPadding),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 16),
+          if (height == null)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else
+            SizedBox(
+              height: height,
+              child: const Center(child: CircularProgressIndicator()),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChartsSection(BuildContext context, List<YtmChart> charts) {
+    final themeProvider = Provider.of<ThemeProvider>(context, listen: false);
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final textTheme = theme.textTheme;
+    final perfMode = themeProvider.resolvedUiPerformanceMode(context);
+    final smoothMode = perfMode == UiPerformanceMode.smooth;
+    final cardWidth = ResponsiveLayout.isExpanded(context) ? 210.0 : 170.0;
+    final sectionHeight = _sectionBodyHeightFor(context);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _SectionHeaderWithArrows(
+          title: 'Charts',
+          titleStyle: textTheme.titleLarge?.copyWith(
+            fontWeight: FontWeight.w700,
+          ),
+          controller: _chartsScrollController,
+        ),
+        const SizedBox(height: 16),
+        SizedBox(
+          height: sectionHeight,
+          child: charts.isEmpty
+              ? Center(
+                  child: Text(
+                    'No charts available right now',
+                    style: TextStyle(color: scheme.onSurfaceVariant),
+                  ),
+                )
+              : ListView.separated(
+                  key: const PageStorageKey<String>('search_screen_charts_row'),
+                  controller: _chartsScrollController,
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.only(left: 2, right: 2, bottom: 8),
+                  cacheExtent: 900,
+                  addAutomaticKeepAlives: !smoothMode,
+                  addRepaintBoundaries: true,
+                  physics: smoothMode
+                      ? const ClampingScrollPhysics()
+                      : const BouncingScrollPhysics(
+                          parent: AlwaysScrollableScrollPhysics(),
+                        ),
+                  itemCount: charts.length,
+                  separatorBuilder: (_, index) => const SizedBox(width: 14),
+                  itemBuilder: (_, index) {
+                    final chart = charts[index];
+                    final imageCandidates = YoutubeThumbnailUtils.candidateUrls(
+                      imageUrl: chart.imageUrl,
+                    );
+
+                    return SizedBox(
+                      width: cardWidth,
+                      child: RepaintBoundary(
+                        child: ThemedContainer(
+                          borderRadius: BorderRadius.circular(18),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(18),
+                            onTap: () {
+                              Navigator.of(context).push(
+                                MaterialPageRoute<void>(
+                                  builder: (_) =>
+                                      ChartSongsScreen(chart: chart),
+                                ),
+                              );
+                            },
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                AspectRatio(
+                                  aspectRatio: 1,
+                                  child: ClipRRect(
+                                    clipBehavior: Clip.antiAlias,
+                                    borderRadius: const BorderRadius.vertical(
+                                      top: Radius.circular(18),
+                                    ),
+                                    child: FallbackNetworkImage(
+                                      urls: imageCandidates,
+                                      width: double.infinity,
+                                      height: double.infinity,
+                                      cacheWidth: 640,
+                                      cacheHeight: 640,
+                                      fit: BoxFit.cover,
+                                      filterQuality: FilterQuality.medium,
+                                      fallback: Container(
+                                        color: scheme.surfaceContainerHighest,
+                                        child: Icon(
+                                          themeProvider.useGlassTheme
+                                              ? CupertinoIcons.waveform
+                                              : Icons.equalizer_rounded,
+                                          size: 34,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                Flexible(
+                                  child: Padding(
+                                    padding: const EdgeInsets.fromLTRB(
+                                      10,
+                                      8,
+                                      10,
+                                      8,
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        SizedBox(
+                                          height: 20,
+                                          child: _AutoMarqueeText(
+                                            text: chart.title,
+                                            style:
+                                                textTheme.titleSmall?.copyWith(
+                                                  fontWeight: FontWeight.w700,
+                                                ) ??
+                                                const TextStyle(
+                                                  fontSize: 14,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                          ),
+                                        ),
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          chart.subtitle,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: textTheme.bodySmall?.copyWith(
+                                            color: scheme.onSurfaceVariant,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTrendingAlbumsSection(
+    BuildContext context,
+    List<YtmAlbum> albums,
+  ) {
+    final themeProvider = Provider.of<ThemeProvider>(context, listen: false);
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final textTheme = theme.textTheme;
+    final perfMode = themeProvider.resolvedUiPerformanceMode(context);
+    final smoothMode = perfMode == UiPerformanceMode.smooth;
+    final cardWidth = ResponsiveLayout.isExpanded(context) ? 210.0 : 170.0;
+    final sectionHeight = _sectionBodyHeightFor(context);
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _SectionHeaderWithArrows(
+            title: 'Trending Albums',
+            titleStyle: textTheme.titleLarge?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+            controller: _albumsScrollController,
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            height: sectionHeight,
+            child: albums.isEmpty
+                ? Center(
+                    child: Text(
+                      'No trending albums right now',
+                      style: TextStyle(color: scheme.onSurfaceVariant),
+                    ),
+                  )
+                : ListView.separated(
+                    key: const PageStorageKey<String>(
+                      'search_screen_albums_row',
+                    ),
+                    controller: _albumsScrollController,
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.only(
+                      left: 2,
+                      right: 2,
+                      bottom: 8,
+                    ),
+                    cacheExtent: 900,
+                    addAutomaticKeepAlives: !smoothMode,
+                    addRepaintBoundaries: true,
+                    physics: smoothMode
+                        ? const ClampingScrollPhysics()
+                        : const BouncingScrollPhysics(
+                            parent: AlwaysScrollableScrollPhysics(),
+                          ),
+                    itemCount: albums.length,
+                    separatorBuilder: (_, index) => const SizedBox(width: 14),
+                    itemBuilder: (_, index) {
+                      final album = albums[index];
+                      final allImageCandidates =
+                          YoutubeThumbnailUtils.candidateUrls(
+                            imageUrl: album.imageUrl,
+                          );
+                      final ytmOnlyCandidates = allImageCandidates
+                          .where(YoutubeThumbnailUtils.isYtmArtworkUrl)
+                          .toList(growable: false);
+                      final imageCandidates = ytmOnlyCandidates.isNotEmpty
+                          ? ytmOnlyCandidates
+                          : allImageCandidates;
+                      final baseImageScale =
+                          YoutubeThumbnailUtils.preferredArtworkScale(
+                            imageUrl: album.imageUrl,
+                            youtubeVideoScale: 2.0,
+                            normalScale: 1.0,
+                          );
+                      final imageScale = ytmOnlyCandidates.isNotEmpty
+                          ? (baseImageScale < 1.04 ? 1.04 : baseImageScale)
+                          : (baseImageScale < 1.12 ? 1.12 : baseImageScale);
+                      final albumAsChart = YtmChart(
+                        playlistId: album.browseId,
+                        browseId: album.browseId,
+                        title: album.title,
+                        subtitle: album.subtitle,
+                        imageUrl: album.imageUrl,
+                      );
+
+                      return SizedBox(
+                        width: cardWidth,
+                        child: RepaintBoundary(
+                          child: ThemedContainer(
+                            borderRadius: BorderRadius.circular(18),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(18),
+                              onTap: () {
+                                Navigator.of(context).push(
+                                  MaterialPageRoute<void>(
+                                    builder: (_) => ChartSongsScreen(
+                                      chart: albumAsChart,
+                                      headerTitle: 'Albums',
+                                    ),
+                                  ),
+                                );
+                              },
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  AspectRatio(
+                                    aspectRatio: 1,
+                                    child: ClipRRect(
+                                      clipBehavior: Clip.antiAlias,
+                                      borderRadius: const BorderRadius.vertical(
+                                        top: Radius.circular(18),
+                                      ),
+                                      child: Transform.scale(
+                                        scale: imageScale,
+                                        child: FallbackNetworkImage(
+                                          urls: imageCandidates,
+                                          width: double.infinity,
+                                          height: double.infinity,
+                                          cacheWidth: 768,
+                                          cacheHeight: 768,
+                                          fit: BoxFit.cover,
+                                          alignment: Alignment.center,
+                                          filterQuality: FilterQuality.medium,
+                                          fallback: Container(
+                                            color:
+                                                scheme.surfaceContainerHighest,
+                                            child: Icon(
+                                              themeProvider.useGlassTheme
+                                                  ? CupertinoIcons.music_albums
+                                                  : Icons.album_rounded,
+                                              size: 34,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  Flexible(
+                                    child: Padding(
+                                      padding: const EdgeInsets.fromLTRB(
+                                        10,
+                                        8,
+                                        10,
+                                        8,
+                                      ),
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          SizedBox(
+                                            height: 20,
+                                            child: _AutoMarqueeText(
+                                              text: album.title,
+                                              style:
+                                                  textTheme.titleSmall
+                                                      ?.copyWith(
+                                                        fontWeight:
+                                                            FontWeight.w700,
+                                                      ) ??
+                                                  const TextStyle(
+                                                    fontSize: 14,
+                                                    fontWeight: FontWeight.w700,
+                                                  ),
+                                            ),
+                                          ),
+                                          const SizedBox(height: 2),
+                                          Text(
+                                            album.subtitle,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: textTheme.bodySmall
+                                                ?.copyWith(
+                                                  color:
+                                                      scheme.onSurfaceVariant,
+                                                ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTrendingSongsSection(
+    BuildContext context,
+    List<SaavnSong> songs,
+  ) {
+    final themeProvider = Provider.of<ThemeProvider>(context, listen: false);
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final textTheme = theme.textTheme;
+    final perfMode = themeProvider.resolvedUiPerformanceMode(context);
+    final fullMode = perfMode == UiPerformanceMode.full;
+    final queuedSongs = songs
+        .map(
+          (s) => QueuedSong(
+            id: s.id,
+            meta: NowPlaying(
+              title: s.name,
+              artist: s.artists,
+              imageUrl: s.imageUrl,
+            ),
+          ),
+        )
+        .toList(growable: false);
+    final dynamicSeedQueries = _buildDynamicSeedQueries(songs);
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 24),
+      child: Column(
+        crossAxisAlignment: fullMode
+            ? CrossAxisAlignment.center
+            : CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: double.infinity,
+            child: fullMode
+                ? AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 200),
+                    child: const Text(
+                      'Trending Songs',
+                      key: ValueKey('trending_songs_full'),
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  )
+                : Text(
+                    'Trending Songs',
+                    style: textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+          ),
+          const SizedBox(height: 16),
+          if (songs.isEmpty)
+            Center(
+              child: Text(
+                'No trending songs right now',
+                style: TextStyle(color: scheme.onSurfaceVariant),
+              ),
+            )
+          else
+            Column(
+              children: List<Widget>.generate(songs.length, (index) {
+                final song = songs[index];
+                final imageCandidates = YoutubeThumbnailUtils.candidateUrls(
+                  songId: song.id,
+                  imageUrl: song.imageUrl,
+                );
+                final imageScale = YoutubeThumbnailUtils.preferredArtworkScale(
+                  songId: song.id,
+                  imageUrl: song.imageUrl,
+                  youtubeVideoScale: 1.0,
+                  normalScale: 1.0,
+                );
+
+                return Padding(
+                  padding: EdgeInsets.only(
+                    bottom: index == songs.length - 1 ? 0 : 10,
+                  ),
+                  child: RepaintBoundary(
+                    child: ThemedContainer(
+                      borderRadius: BorderRadius.circular(14),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(14),
+                        onTap: () async {
+                          if (index < 0 || index >= queuedSongs.length) return;
+                          await AudioPlayerService().playFromList(
+                            songs: queuedSongs,
+                            startIndex: index,
+                            autoExtendQueue: true,
+                            dynamicSeedQueries: dynamicSeedQueries,
+                          );
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 8,
+                          ),
+                          child: Row(
+                            children: [
+                              ClipRRect(
+                                clipBehavior: Clip.antiAlias,
+                                borderRadius: BorderRadius.circular(10),
+                                child: Transform.scale(
+                                  scale: imageScale,
+                                  child: FallbackNetworkImage(
+                                    urls: imageCandidates,
+                                    width: 56,
+                                    height: 56,
+                                    cacheWidth: 320,
+                                    cacheHeight: 320,
+                                    fit: BoxFit.cover,
+                                    alignment: Alignment.center,
+                                    filterQuality: FilterQuality.medium,
+                                    fallback: Container(
+                                      width: 56,
+                                      height: 56,
+                                      color: scheme.surfaceContainerHighest,
+                                      child: Icon(
+                                        themeProvider.useGlassTheme
+                                            ? CupertinoIcons.music_note_2
+                                            : Icons.music_note_rounded,
+                                        size: 24,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      song.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: textTheme.titleSmall?.copyWith(
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      song.artists,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: textTheme.bodySmall?.copyWith(
+                                        color: scheme.onSurfaceVariant,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLocalSearchResults(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final textTheme = theme.textTheme;
+    final query = _controller.text.trim();
+    if (query.isNotEmpty && query.length < minSearchLength) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Text(
+            'Type at least $minSearchLength characters to search',
+            style: textTheme.bodyMedium?.copyWith(
+              color: scheme.onSurfaceVariant,
+            ),
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
+
+    if (query.isEmpty) {
+      final results = _localAudios
+          .map(
+            (track) => SaavnSong(
+              id: track.path,
+              name: track.name,
+              artists: 'Local Audio',
+              imageUrl: '',
+              duration: 0,
+              downloadUrls: const [],
+            ),
+          )
+          .toList(growable: false);
+
+      if (results.isEmpty) {
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: Text(
+              'No local audio files found on your device',
+              style: textTheme.bodyMedium?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        );
+      }
+
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: Column(
+          children: results.asMap().entries.map((entry) {
+            final index = entry.key;
+            final song = entry.value;
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: ThemedContainer(
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(14),
+                  onTap: () async {
+                    await AudioPlayerService().playLocalFiles(
+                      files: results
+                          .map((s) => (path: s.id, name: s.name))
+                          .toList(),
+                      startIndex: index,
+                    );
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                song.name,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: textTheme.bodyMedium?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Local Audio',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: textTheme.bodySmall?.copyWith(
+                                  color: scheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }).toList(),
+        ),
+      );
+    }
+
+    return FutureBuilder<List<SaavnSong>>(
+      future: _searchFuture,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        if (snapshot.hasError) {
+          return Center(
+            child: Text(
+              'Error loading local audio: ${snapshot.error}',
+              style: TextStyle(color: scheme.error),
+            ),
+          );
+        }
+
+        final results = snapshot.data ?? [];
+        if (results.isEmpty) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(32),
+              child: Text(
+                'No matches found',
+                style: textTheme.bodyMedium?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          );
+        }
+
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Column(
+            children: results.asMap().entries.map((entry) {
+              final index = entry.key;
+              final song = entry.value;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: ThemedContainer(
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(14),
+                    onTap: () async {
+                      await AudioPlayerService().playLocalFiles(
+                        files: results
+                            .map((s) => (path: s.id, name: s.name))
+                            .toList(),
+                        startIndex: index,
+                      );
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  song.name,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: textTheme.bodyMedium?.copyWith(
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  'Local Audio',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: textTheme.bodySmall?.copyWith(
+                                    color: scheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSearchAlbumsSection(
+    BuildContext context, {
+    required List<YtmAlbum> albums,
+    required bool loading,
+  }) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final textTheme = theme.textTheme;
+    final cardWidth = ResponsiveLayout.isExpanded(context) ? 210.0 : 172.0;
+    final sectionHeight = _sectionBodyHeightFor(context);
+
+    if (loading) {
+      return SizedBox(
+        height: sectionHeight,
+        child: const Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (albums.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 12),
+        child: Text(
+          'No related albums found',
+          style: textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+      );
+    }
+
+    return SizedBox(
+      height: sectionHeight,
+      child: ListView.separated(
+        key: const PageStorageKey<String>('search_screen_albums_query_row'),
+        scrollDirection: Axis.horizontal,
+        controller: _searchAlbumsScrollController,
+        padding: const EdgeInsets.only(right: 2, bottom: 8),
+        itemCount: albums.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 14),
+        itemBuilder: (_, index) {
+          final album = albums[index];
+          final allImageCandidates = YoutubeThumbnailUtils.candidateUrls(
+            imageUrl: album.imageUrl,
+          );
+          final ytmOnlyCandidates = allImageCandidates
+              .where(YoutubeThumbnailUtils.isYtmArtworkUrl)
+              .toList(growable: false);
+          final imageCandidates = ytmOnlyCandidates.isNotEmpty
+              ? ytmOnlyCandidates
+              : allImageCandidates;
+          final baseImageScale = YoutubeThumbnailUtils.preferredArtworkScale(
+            imageUrl: album.imageUrl,
+            youtubeVideoScale: 2.0,
+            normalScale: 1.0,
+          );
+          final imageScale = ytmOnlyCandidates.isNotEmpty
+              ? (baseImageScale < 1.04 ? 1.04 : baseImageScale)
+              : (baseImageScale < 1.12 ? 1.12 : baseImageScale);
+
+          final albumAsChart = YtmChart(
+            playlistId: album.browseId,
+            browseId: album.browseId,
+            title: album.title,
+            subtitle: album.subtitle,
+            imageUrl: album.imageUrl,
+          );
+
+          return SizedBox(
+            width: cardWidth,
+            child: RepaintBoundary(
+              child: ThemedContainer(
+                borderRadius: BorderRadius.circular(18),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(18),
+                  onTap: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => ChartSongsScreen(
+                          chart: albumAsChart,
+                          headerTitle: 'Albums',
+                        ),
+                      ),
+                    );
+                  },
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      AspectRatio(
+                        aspectRatio: 1,
+                        child: ClipRRect(
+                          clipBehavior: Clip.antiAlias,
+                          borderRadius: const BorderRadius.vertical(
+                            top: Radius.circular(18),
+                          ),
+                          child: Transform.scale(
+                            scale: imageScale,
+                            child: FallbackNetworkImage(
+                              urls: imageCandidates,
+                              width: double.infinity,
+                              height: double.infinity,
+                              cacheWidth: 768,
+                              cacheHeight: 768,
+                              fit: BoxFit.cover,
+                              alignment: Alignment.center,
+                              filterQuality: FilterQuality.medium,
+                              fallback: Container(
+                                color: scheme.surfaceContainerHighest,
+                                child: const Icon(
+                                  Icons.album_rounded,
+                                  size: 34,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      Flexible(
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SizedBox(
+                                height: 20,
+                                child: _AutoMarqueeText(
+                                  text: album.title,
+                                  style:
+                                      textTheme.titleSmall?.copyWith(
+                                        fontWeight: FontWeight.w700,
+                                      ) ??
+                                      const TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                album.subtitle,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: textTheme.bodySmall?.copyWith(
+                                  color: scheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildSearchResultsSliver(BuildContext context) {
+    final query = _controller.text.trim();
+    final theme = Theme.of(context);
+    final columns = ResponsiveLayout.adaptiveGridColumns(
+      context,
+      minCardWidth: 415,
+      minColumns: 2,
+      maxColumns: 6,
+    );
+    final gridGap = columns >= 4 ? 18.0 : 14.0;
+    final aspectRatio = switch (columns) {
+      >= 5 => 0.78,
+      4 => 0.75,
+      3 => 0.72,
+      _ => 0.68,
+    };
+    final showAlbumsSection =
+        _useYoutubeService && query.length >= minSearchLength;
+    final showSongsSectionTitle = query.isNotEmpty;
+
+    if (query.isNotEmpty && query.length < minSearchLength) {
+      return SliverToBoxAdapter(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: Text(
+              'Type at least $minSearchLength characters to search',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      );
+    }
+
+    final perfMode = Provider.of<ThemeProvider>(
+      context,
+      listen: false,
+    ).resolvedUiPerformanceMode(context);
+    final smoothMode = perfMode == UiPerformanceMode.smooth;
+
+    return FutureBuilder<List<SaavnSong>>(
+      future: _searchFuture,
+      builder: (context, songSnapshot) {
+        if (songSnapshot.connectionState == ConnectionState.waiting) {
+          return const SliverToBoxAdapter(
+            child: Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Center(child: CircularProgressIndicator()),
+            ),
+          );
+        }
+
+        if (songSnapshot.hasError) {
+          return SliverToBoxAdapter(
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(32),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Provider.of<ThemeProvider>(context).useGlassTheme
+                          ? CupertinoIcons.exclamationmark_triangle
+                          : Icons.error_outline,
+                      size: 48,
+                      color: theme.colorScheme.error,
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      'Failed to load songs',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w500,
+                        color: theme.colorScheme.onSurface,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'API might be down or network issue',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 14),
+                    OutlinedButton(
+                      onPressed: _refreshSearch,
+                      child: const Text('Retry'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }
+
+        final songs = List<SaavnSong>.from(
+          songSnapshot.data ?? const <SaavnSong>[],
+        );
+
+        final queuedSongs = songs
+            .map(
+              (s) => QueuedSong(
+                id: s.id,
+                meta: NowPlaying(
+                  title: s.name,
+                  artist: s.artists,
+                  imageUrl: s.imageUrl,
+                ),
+              ),
+            )
+            .toList();
+        final dynamicSeedQueries = query.isEmpty
+            ? _buildDynamicSeedQueries(songs)
+            : const <String>[];
+
+        return SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (showSongsSectionTitle) ...[
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Text(
+                      'Songs',
+                      style: theme.textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                if (songs.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Center(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 20),
+                        child: Text(
+                          query.isEmpty
+                              ? 'No quick picks found'
+                              : 'No songs found',
+                          style: theme.textTheme.bodyLarge?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    ),
+                  )
+                else
+                  GridView.builder(
+                    padding: EdgeInsets.zero,
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    cacheExtent: smoothMode ? 420 : 720,
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: columns,
+                      mainAxisSpacing: gridGap,
+                      crossAxisSpacing: gridGap,
+                      childAspectRatio: aspectRatio,
+                    ),
+                    itemCount: songs.length,
+                    itemBuilder: (_, i) {
+                      final song = songs[i];
+                      return RepaintBoundary(
+                        child: SongCard(
+                          song: song,
+                          onTap: () async {
+                            if (i < 0 || i >= queuedSongs.length) return;
+
+                            await AudioPlayerService().playFromList(
+                              songs: queuedSongs,
+                              startIndex: i,
+                              autoExtendQueue: true,
+                              dynamicSeedQueries: dynamicSeedQueries,
+                            );
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                if (showAlbumsSection) ...[
+                  const SizedBox(height: 26),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: _SectionHeaderWithArrows(
+                      title: 'Albums',
+                      titleStyle: theme.textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                      controller: _searchAlbumsScrollController,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: FutureBuilder<List<YtmAlbum>>(
+                      future: _albumSearchFuture,
+                      builder: (context, albumSnapshot) {
+                        if (albumSnapshot.connectionState ==
+                            ConnectionState.waiting) {
+                          return _buildSearchAlbumsSection(
+                            context,
+                            albums: const <YtmAlbum>[],
+                            loading: true,
+                          );
+                        }
+
+                        if (albumSnapshot.hasError) {
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 4, bottom: 12),
+                            child: Text(
+                              'Unable to load albums',
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: theme.colorScheme.error,
+                              ),
+                            ),
+                          );
+                        }
+
+                        final albums = albumSnapshot.data ?? const <YtmAlbum>[];
+                        return _buildSearchAlbumsSection(
+                          context,
+                          albums: albums,
+                          loading: false,
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _SessionSearchCacheEntry {
+  final List<SaavnSong> songs;
+
+  const _SessionSearchCacheEntry({required this.songs});
+}
+
+class _HomeSectionsData {
+  final List<YtmChart> charts;
+  final List<YtmAlbum> albums;
+  final List<SaavnSong> trendingSongs;
+
+  const _HomeSectionsData({
+    required this.charts,
+    required this.albums,
+    required this.trendingSongs,
+  });
+
+  const _HomeSectionsData.empty()
+    : charts = const <YtmChart>[],
+      albums = const <YtmAlbum>[],
+      trendingSongs = const <SaavnSong>[];
+}
+
+class _ScoredSong {
+  final SaavnSong song;
+  final int score;
+
+  const _ScoredSong({required this.song, required this.score});
+}
+
+class _AutoMarqueeText extends StatelessWidget {
+  final String text;
+  final TextStyle style;
+
+  const _AutoMarqueeText({required this.text, required this.style});
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (_, constraints) {
+        final painter = TextPainter(
+          text: TextSpan(text: text, style: style),
+          maxLines: 1,
+          textDirection: TextDirection.ltr,
+        )..layout(maxWidth: constraints.maxWidth);
+
+        if (!painter.didExceedMaxLines) {
+          return Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: style,
+          );
+        }
+
+        return Marquee(
+          text: text,
+          style: style,
+          blankSpace: 28,
+          velocity: 22,
+          pauseAfterRound: const Duration(milliseconds: 900),
+          startPadding: 2,
+          fadingEdgeStartFraction: 0.08,
+          fadingEdgeEndFraction: 0.08,
+          accelerationDuration: const Duration(milliseconds: 250),
+          decelerationDuration: const Duration(milliseconds: 250),
+        );
+      },
+    );
+  }
+}
+
+class _SectionHeaderWithArrows extends StatelessWidget {
+  final String title;
+  final TextStyle? titleStyle;
+  final ScrollController controller;
+  final double scrollAmount;
+
+  const _SectionHeaderWithArrows({
+    required this.title,
+    required this.controller,
+    this.titleStyle,
+    this.scrollAmount = 620,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isWindows =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.windows;
+
+    return Row(
+      children: [
+        Expanded(child: Text(title, style: titleStyle)),
+        if (isWindows && ResponsiveLayout.isExpanded(context)) ...[
+          const SizedBox(width: 8),
+          _ScrollArrowButton(
+            icon: Icons.chevron_left_rounded,
+            onPressed: () {
+              if (!controller.hasClients) return;
+              final target = (controller.offset - scrollAmount).clamp(
+                0.0,
+                controller.position.maxScrollExtent,
+              );
+              controller.animateTo(
+                target,
+                duration: const Duration(milliseconds: 300),
+                curve: Curves.easeOutCubic,
+              );
+            },
+          ),
+          const SizedBox(width: 4),
+          _ScrollArrowButton(
+            icon: Icons.chevron_right_rounded,
+            onPressed: () {
+              if (!controller.hasClients) return;
+              final target = (controller.offset + scrollAmount).clamp(
+                0.0,
+                controller.position.maxScrollExtent,
+              );
+              controller.animateTo(
+                target,
+                duration: const Duration(milliseconds: 300),
+                curve: Curves.easeOutCubic,
+              );
+            },
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _ScrollArrowButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  const _ScrollArrowButton({required this.icon, required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerHighest.withValues(alpha: 0.92),
+      elevation: 2,
+      shadowColor: scheme.shadow.withValues(alpha: 0.14),
+      borderRadius: BorderRadius.circular(999),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(999),
+        onTap: onPressed,
+        child: Container(
+          width: 30,
+          height: 30,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: scheme.outlineVariant.withValues(alpha: 0.5),
+            ),
+          ),
+          child: Icon(icon, size: 18, color: scheme.onSurface),
+        ),
+      ),
+    );
+  }
+}
+
+class _StickySearchBarDelegate extends SliverPersistentHeaderDelegate {
+  final Widget child;
+  final double height;
+
+  const _StickySearchBarDelegate({required this.child, required this.height});
+
+  @override
+  Widget build(
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
+    return Container(
+      color: Theme.of(context).colorScheme.surface,
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Align(alignment: Alignment.bottomCenter, child: child),
+    );
+  }
+
+  @override
+  double get maxExtent => height;
+  @override
+  double get minExtent => height;
+  @override
+  bool shouldRebuild(_StickySearchBarDelegate old) => old.child != child;
+}

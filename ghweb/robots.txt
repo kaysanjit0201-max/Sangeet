@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+
+Disallow: /version.json
+Disallow: /version-dev.json
+
+Sitemap: https://kaysanjit0201-max.github.io/Sangeet/sitemap.xml
